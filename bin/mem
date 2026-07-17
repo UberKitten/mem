@@ -31,6 +31,8 @@ Configuration (env vars override a config file at $XDG_CONFIG_HOME/mem/config):
     MEM_OPENAI_BW_ITEM    Bitwarden item id/name holding the embeddings API key
     OPENAI_API_KEY        used directly if set (takes precedence over Bitwarden)
     MEM_EMBED_MODEL       embeddings model (default text-embedding-3-large)
+    MEM_DEEP_REMOTE       ssh host to delegate `search --deep` to when this
+                          machine has no key/index (keyless-client pattern)
 
 The config file is plain `KEY=value` lines (# comments allowed) — the same file
 is read by the distiller wrapper. See install/config.example.
@@ -46,6 +48,7 @@ only, and is never printed or logged.
 import os
 import re
 import sys
+import shlex
 import glob
 import json
 import hashlib
@@ -744,6 +747,15 @@ def cmd_embed(_args):
 def deep_search(query, k=10):
     key = get_openai_key()
     if key is None or not INDEX_DB.exists():
+        # Machines without a local key/index can delegate the whole deep search
+        # to a host that has both (MEM_DEEP_REMOTE=<ssh-host>). The remote host
+        # needs mem on its ssh non-interactive PATH or at ~/bin/mem.
+        remote = os.environ.get("MEM_DEEP_REMOTE")
+        if remote:
+            print(f"[--deep delegating to {remote}]\n", file=sys.stderr)
+            r = subprocess.run(["ssh", remote, "~/bin/mem", "search", "--deep",
+                                shlex.quote(query)])
+            sys.exit(r.returncode)
         why = "no API key configured" if key is None else "no index (run `mem embed`)"
         print(f"[--deep unavailable: {why}; falling back to plain search]\n",
               file=sys.stderr)

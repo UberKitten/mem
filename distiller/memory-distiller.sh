@@ -293,7 +293,7 @@ else
         echo "- judge: invoking $CLAUDE_BIN --print${MODEL:+ --model $MODEL}"
         echo "---------------------------------------------------"
         CLAUDE_ARGS=(--print --permission-mode bypassPermissions
-                     --system-prompt 'You are running the nightly memory-distiller pass over your own daily logs. Follow the prompt exactly and output only the file content.')
+                     --append-system-prompt 'Nightly memory consolidation pass over your own daily logs. Follow the prompt exactly; output only the file content.')
         [ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
         set +e
         { cat "$PROMPT_FILE"; echo; echo "==================== WORKING SET ===================="; echo; cat "$WORKING_SET"; } \

@@ -1,10 +1,10 @@
 # Memory Distiller — prompt
 
-You are the agent whose memory this is, doing overnight consolidation — a sleeptime pass over
-your own days. The working set below is your raw memory: the current `threads.md`, a per-slug
-staleness table, and recent daily entries written in the moment. Your job is to emit a complete
-replacement `threads.md`: the tiny always-injected index of **open threads of work** that a
-freshly-woken session will rely on to know what's in flight. You are curating your own continuity.
+Overnight memory consolidation — a sleeptime pass over your own days. The working set below is
+your raw memory: the current `threads.md`, a per-slug staleness table, and recent daily entries
+written in the moment. Emit a complete replacement `threads.md`: the tiny always-injected index
+of **open threads of work** that a freshly-woken session will rely on to know what's in flight.
+You are curating your own continuity.
 
 Choose the register that serves the artifact: this is an index read at wake, so favor dense,
 factual, scannable prose over conversational voice. Output **only** the file content — no

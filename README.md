@@ -258,6 +258,7 @@ lines). See `install/config.example`.
 | `MEM_EMBED_MODEL` | `text-embedding-3-large` | Embeddings model |
 | `MEM_EMBED_DIMS` | `3072` | Embedding dimensions |
 | `MEM_EMBED_BASE_URL` | `https://api.openai.com/v1` | Embeddings API base URL |
+| `MEM_DEEP_REMOTE` | *(unset)* | ssh host to delegate `search --deep` to when this machine has no key/index — the keyless-client pattern (remote host needs `mem` at `~/bin/mem` and its own key + index) |
 | `MEM_HEALTH_GRACE_HOURS` | `48` | Staleness grace window for the health check |
 
 ## Layout
