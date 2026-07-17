@@ -1,0 +1,19 @@
+# per-machine state — never committed
+*.db
+index.db
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editor / OS
+.DS_Store
+*.swp
+
+# local test scratch
+/tmp-test/
+
+# lint/build caches
+.ruff_cache/

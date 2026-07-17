@@ -1,0 +1,12 @@
+# systemd user timer — fires the distiller nightly at 04:30 local time.
+# See mem-distiller.service for setup steps.
+
+[Unit]
+Description=Nightly memory distiller timer
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

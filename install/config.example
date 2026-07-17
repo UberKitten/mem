@@ -1,0 +1,38 @@
+# mem config — copy to $XDG_CONFIG_HOME/mem/config (usually ~/.config/mem/config).
+# Plain KEY=value lines; `#` comments allowed. Read by both `bin/mem` and the
+# distiller. Environment variables always override anything set here.
+
+# Workspace root. The memory dir is $MEM_ROOT/memory. Point this at the git repo
+# (or plain directory) where your notes live.
+MEM_ROOT=$HOME/memory-workspace
+
+# Optional extra read-only root to fold into `mem search` and `mem catalog`
+# (e.g. a notes vault). Leave unset to search only the workspace.
+# MEM_VAULT=$HOME/notes
+# MEM_VAULT_LABEL=notes
+
+# Disable the automatic git commit on capture (any non-empty value disables it).
+# MEM_NO_COMMIT=1
+
+# --- distiller: judge CLI ---
+# Any `claude --print`-compatible CLI works (reads a prompt on stdin, writes the
+# file to stdout). Set the binary and/or model here.
+# MEM_CLAUDE_BIN=claude
+# MEM_JUDGE_MODEL=
+
+# Full override of the judge command (reads stdin -> stdout). If set, the two
+# vars above are ignored. Use this to plug in a different provider's CLI.
+# MEM_JUDGE_CMD=llm -m gpt-4o
+
+# Optional long-lived headless auth token file for the judge CLI (avoids
+# interactive-login token expiry under cron).
+# MEM_CLAUDE_OAUTH_TOKEN_FILE=$HOME/.config/mem/claude-oauth-token
+
+# --- optional: --deep embeddings lane ---
+# An OpenAI-compatible embeddings API key. Prefer setting OPENAI_API_KEY in the
+# environment over storing it here. Alternatively name a Bitwarden item holding
+# the key (fetched via `bw get password <item>`, never printed).
+# OPENAI_API_KEY=sk-...
+# MEM_OPENAI_BW_ITEM=openai-api-key
+# MEM_EMBED_MODEL=text-embedding-3-large
+# MEM_EMBED_BASE_URL=https://api.openai.com/v1

@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: ruff
+        run: ruff check --select E,F,W --ignore E501,E741,E402 bin/mem
+      - name: py_compile
+        run: python3 -m py_compile bin/mem
+      - name: shellcheck
+        run: shellcheck distiller/memory-distiller.sh install/health-check.sh
+
+  smoke:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ripgrep jq; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install ripgrep jq; fi
+      - name: setup workspace
+        run: |
+          export MEM_ROOT="$RUNNER_TEMP/ws"
+          mkdir -p "$MEM_ROOT" && git -C "$MEM_ROOT" init -q
+          echo "MEM_ROOT=$MEM_ROOT" >> "$GITHUB_ENV"
+          echo "XDG_DATA_HOME=$RUNNER_TEMP/data" >> "$GITHUB_ENV"
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+      - name: capture + recall
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name ci
+          mem -t deploy-pipeline "staging cutover verified"
+          echo "valves arrive next week" | mem -t garden-irrigation "drip zones re-plumbed"
+          mem "picked the blue tiles"
+          mem thread deploy-pipeline | grep -q "staging cutover verified"
+          mem search valves | grep -qi valves
+          mem recent | grep -q "garden-irrigation"
+          mem catalog >/dev/null
+          test "$(git -C "$MEM_ROOT" rev-list --count HEAD)" = "3"
+      - name: distiller gather + enforce (canned judge)
+        run: |
+          STATE="$XDG_DATA_HOME/mem/distiller"
+          mkdir -p "$STATE"
+          printf '# Open Threads\n\n## deploy-pipeline — active, last 2026-07-11\nStaging cutover verified; prod rollout pending.\n→ mem thread deploy-pipeline · memory/2026-07-11.md\n' > "$STATE/judge-output.md"
+          bash distiller/memory-distiller.sh --skip-judge --no-commit
+          grep -q "# Open Threads" "$MEM_ROOT/memory/threads.md"
+          grep -q "do not hand-edit" "$MEM_ROOT/memory/threads.md"

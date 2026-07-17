@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+"""mem — a two-tier agent-memory CLI.
+
+Capture structured entries into append-only daily notes, and recall them fast.
+Design notes: docs/design.md
+
+Entry grammar (THE contract — the distiller and recall both depend on it):
+
+    ### 14:32 [deploy-pipeline] staging cutover verified, prod scheduled Friday
+    optional body — any markdown, any length, until the next ### or EOF
+
+Verbs:
+    mem [-t slug] "summary"     append entry (body via stdin pipe), then git commit
+    mem search <pattern>        ripgrep across the workspace (+ optional extra root)
+    mem search --deep <query>   embeddings hybrid (falls back to plain search)
+    mem thread <slug>           every entry with that slug, chronological, with dates
+    mem threads                 print memory/threads.md
+    mem recent [n]              last n structured entries (default 10)
+    mem show <date>             print that daily (YYYY-MM-DD)
+    mem close <slug> <reason>   append a CLOSED: entry (distiller retire signal)
+    mem catalog [--write]       generate the on-demand-file catalog
+    mem embed                   (re)build the --deep embeddings index, incrementally
+
+Core verbs are stdlib-only + shell out to `rg` and `git`. The --deep lane uses
+sqlite-vec + an OpenAI embeddings model; see the --deep section near the bottom.
+
+Configuration (env vars override a config file at $XDG_CONFIG_HOME/mem/config):
+    MEM_ROOT              workspace root; memory dir is $MEM_ROOT/memory
+    MEM_VAULT             optional extra read-only root to include in search/catalog
+    MEM_NO_COMMIT         set (to any value) to skip the git commit on capture/close
+    MEM_OPENAI_BW_ITEM    Bitwarden item id/name holding the embeddings API key
+    OPENAI_API_KEY        used directly if set (takes precedence over Bitwarden)
+    MEM_EMBED_MODEL       embeddings model (default text-embedding-3-large)
+
+The config file is plain `KEY=value` lines (# comments allowed) — the same file
+is read by the distiller wrapper. See install/config.example.
+
+Portability: core verbs run on any POSIX system with python3 (stdlib only), `rg`,
+and `git`. Written to work on macOS's system python3 (no third-party packages) as
+well as Linux.
+
+Credentials never enter agent context: an API key flows env/Bitwarden -> process
+only, and is never printed or logged.
+"""
+
+import os
+import re
+import sys
+import glob
+import json
+import hashlib
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+# --- config file -----------------------------------------------------------
+
+
+def _config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "mem" / "config"
+
+
+def load_config():
+    """Populate os.environ defaults from the config file. Env always wins:
+    a value already present in the environment is never overwritten."""
+    path = _config_path()
+    if not path.is_file():
+        return
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            # allow `export KEY=value`
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except OSError:
+        pass
+
+
+load_config()
+
+# --- locations -------------------------------------------------------------
+
+
+def _default_root():
+    """When MEM_ROOT is unset and no config supplies it, fall back to a repo
+    root if `mem` is being run from a checkout, else ~/memory-workspace."""
+    here = Path(__file__).resolve()
+    # bin/mem inside a checkout -> repo root is here.parent.parent, but that is
+    # only a memory workspace if it has a memory/ dir. Otherwise use the default.
+    candidate = here.parent.parent
+    if (candidate / "memory").is_dir():
+        return candidate
+    return Path.home() / "memory-workspace"
+
+
+ROOT = Path(os.environ.get("MEM_ROOT") or _default_root())
+MEMORY = ROOT / "memory"
+DOCS = ROOT / "docs"
+REFERENCE = ROOT / "reference"          # may not exist yet — tolerated everywhere
+SKILLS = ROOT / "skills"
+GENERATED = ROOT / "generated"
+
+# Optional extra read-only root (e.g. a notes vault) folded into search + catalog.
+_vault_env = os.environ.get("MEM_VAULT", "").strip()
+VAULT = Path(os.path.expanduser(_vault_env)) if _vault_env else None
+VAULT_LABEL = os.environ.get("MEM_VAULT_LABEL", "vault")
+
+_share = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share"))
+INDEX_DB = _share / "mem" / "index.db"   # per-machine, NOT in git
+# uv-managed venv holding sqlite-vec (a system python3 is often externally-managed
+# / PEP 668, so we don't pip-install into it; the sqlite_vec wrapper is pure-python
+# and loads fine cross-interpreter — see _load_sqlite_vec()).
+VENV = _share / "mem" / "venv"
+
+EMBED_MODEL = os.environ.get("MEM_EMBED_MODEL", "text-embedding-3-large")
+EMBED_DIMS = int(os.environ.get("MEM_EMBED_DIMS", "3072"))
+
+VERBS = {"search", "thread", "threads", "recent", "show", "close", "catalog", "embed"}
+
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+ENTRY_RE = re.compile(r"^### (\d{2}:\d{2}) \[([a-z0-9-]+)\] (.*)$")
+SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+HEADING_RE = re.compile(r"^#{1,6}\s")
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def daily_files():
+    """All YYYY-MM-DD.md dailies, oldest-first by filename."""
+    if not MEMORY.is_dir():
+        return []
+    return sorted(p for p in MEMORY.iterdir() if DATE_RE.match(p.name))
+
+
+# --- entry parsing ---------------------------------------------------------
+
+class Entry:
+    __slots__ = ("date", "time", "slug", "summary", "body", "path")
+
+    def __init__(self, date, time, slug, summary, path):
+        self.date, self.time, self.slug = date, time, slug
+        self.summary, self.body, self.path = summary, [], path
+
+    @property
+    def sort_key(self):
+        return (self.date, self.time)
+
+
+def parse_daily(path):
+    """Yield structured Entry objects from one daily. Non-matching (legacy)
+    content is opaque: it's swallowed as body of the current entry, or ignored
+    when no entry is open. grep/search still covers it."""
+    date = path.stem
+    cur = None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = ENTRY_RE.match(line)
+        if m:
+            if cur:
+                yield cur
+            cur = Entry(date, m.group(1), m.group(2), m.group(3).strip(), path)
+        elif cur is not None:
+            cur.body.append(line)
+    if cur:
+        yield cur
+
+
+def all_entries():
+    for p in daily_files():
+        yield from parse_daily(p)
+
+
+# --- capture ---------------------------------------------------------------
+
+def read_stdin_body():
+    if sys.stdin is None or sys.stdin.isatty():
+        return ""
+    return sys.stdin.read().rstrip("\n")
+
+
+def append_entry(slug, summary, body):
+    """Append a `### HH:MM [slug] summary` entry to today's daily. Returns the path."""
+    MEMORY.mkdir(parents=True, exist_ok=True)
+    now = datetime.now()                       # user-local time, per design
+    path = MEMORY / f"{now:%Y-%m-%d}.md"
+    hhmm = f"{now:%H:%M}"
+
+    chunk = f"### {hhmm} [{slug}] {summary}\n"
+    if body:
+        chunk += body.rstrip("\n") + "\n"
+
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    with path.open("a", encoding="utf-8") as f:
+        if existing and not existing.endswith("\n"):
+            f.write("\n")
+        if existing.strip():          # blank line before the new entry for readability
+            f.write("\n")
+        f.write(chunk)
+    return path, hhmm
+
+
+def git_commit(path, slug, summary):
+    if os.environ.get("MEM_NO_COMMIT"):
+        return
+    if not (ROOT / ".git").exists():
+        return                        # not a git repo — capture still lands on disk
+    rel = os.path.relpath(path, ROOT)
+    msg = f"mem: {slug} {summary[:60]}".rstrip()
+    try:
+        subprocess.run(["git", "-C", str(ROOT), "add", rel],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(ROOT), "commit", "-q", "-m", msg],
+                       check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        # non-fatal: the entry is on disk regardless
+        err = (e.stderr or b"").decode("utf-8", "replace").strip()
+        print(f"warning: git commit failed ({err})", file=sys.stderr)
+
+
+def cmd_capture(args):
+    slug, rest = "misc", []
+    i = 0
+    while i < len(args):
+        if args[i] in ("-t", "--tag") and i + 1 < len(args):
+            slug = args[i + 1]
+            i += 2
+        else:
+            rest.append(args[i])
+            i += 1
+    summary = " ".join(rest).strip()
+    if not summary:
+        die('usage: mem [-t slug] "summary"   (body via stdin)')
+    if not SLUG_RE.match(slug):
+        die(f"bad slug {slug!r}: must match [a-z0-9-]+")
+    body = read_stdin_body()
+    path, hhmm = append_entry(slug, summary, body)
+    git_commit(path, slug, summary)
+    print(f"-> {os.path.relpath(path, ROOT)}  ### {hhmm} [{slug}] {summary}", file=sys.stderr)
+
+
+def cmd_close(args):
+    if not args:
+        die("usage: mem close <slug> <reason>")
+    slug = args[0]
+    if not SLUG_RE.match(slug):
+        die(f"bad slug {slug!r}: must match [a-z0-9-]+")
+    reason = " ".join(args[1:]).strip() or "(no reason given)"
+    summary = f"CLOSED: {reason}"
+    path, hhmm = append_entry(slug, summary, "")
+    git_commit(path, slug, summary)
+    print(f"-> closed [{slug}] at {hhmm}: {reason}", file=sys.stderr)
+
+
+# --- recall: thread / recent / threads / show ------------------------------
+
+def cmd_thread(args):
+    if not args:
+        die("usage: mem thread <slug>")
+    slug = args[0]
+    hits = [e for e in all_entries() if e.slug == slug]
+    hits.sort(key=lambda e: e.sort_key)
+    if not hits:
+        die(f"no entries for thread [{slug}]")
+    print(f"=== thread: {slug} ({len(hits)} entries, "
+          f"{hits[0].date} -> {hits[-1].date}) ===\n")
+    for e in hits:
+        print(f"{e.date} {e.time}  {e.summary}")
+        for line in e.body:
+            if line.strip():
+                print(f"    {line}")
+        print()
+
+
+def cmd_recent(args):
+    n = 10
+    if args:
+        try:
+            n = int(args[0])
+        except ValueError:
+            die("usage: mem recent [n]")
+    entries = sorted(all_entries(), key=lambda e: e.sort_key, reverse=True)[:n]
+    if not entries:
+        die("no structured entries found (dailies may predate the new grammar)")
+    for e in entries:
+        print(f"{e.date} {e.time} [{e.slug}] {e.summary}")
+
+
+def cmd_threads(_args):
+    p = MEMORY / "threads.md"
+    if not p.exists():
+        die("no memory/threads.md yet (the distiller writes it nightly)")
+    sys.stdout.write(p.read_text(encoding="utf-8"))
+
+
+def cmd_show(args):
+    if not args:
+        die("usage: mem show <YYYY-MM-DD>")
+    date = args[0]
+    p = MEMORY / f"{date}.md"
+    if not p.exists():
+        die(f"no daily for {date}")
+    sys.stdout.write(p.read_text(encoding="utf-8"))
+
+
+# --- search (ripgrep) ------------------------------------------------------
+
+def search_dirs():
+    dirs = [d for d in (MEMORY, DOCS, REFERENCE, SKILLS) if d.is_dir()]
+    if VAULT and VAULT.is_dir():
+        dirs.append(VAULT)
+    return dirs
+
+
+def nearest_heading(lines, idx):
+    """First heading at or above line index idx (0-based)."""
+    for j in range(idx, -1, -1):
+        if HEADING_RE.match(lines[j]):
+            return lines[j].strip()
+    return None
+
+
+def ripgrep_matches(pattern, dirs):
+    """Return {path: [(lineno, text), ...]} using rg --json."""
+    cmd = ["rg", "-i", "--json", "--", pattern] + [str(d) for d in dirs]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    out = {}
+    for raw in proc.stdout.splitlines():
+        try:
+            evt = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if evt.get("type") != "match":
+            continue
+        d = evt["data"]
+        path = d["path"].get("text")
+        if path is None:
+            continue
+        text = (d["lines"].get("text") or "").rstrip("\n")
+        out.setdefault(path, []).append((d["line_number"], text))
+    return out
+
+
+def cmd_search(args):
+    deep = False
+    if args and args[0] == "--deep":
+        deep = True
+        args = args[1:]
+    if not args:
+        die("usage: mem search [--deep] <pattern>")
+    pattern = " ".join(args)
+    if deep:
+        return deep_search(pattern)
+    plain_search(pattern)
+
+
+def plain_search(pattern):
+    matches = ripgrep_matches(pattern, search_dirs())
+    if not matches:
+        print(f"no matches for {pattern!r}")
+        return
+    # newest-first by file mtime
+    files = sorted(matches, key=lambda p: os.path.getmtime(p), reverse=True)
+    for path in files:
+        rel = _relpath(path)
+        try:
+            lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        print(f"\n{rel}")
+        last_heading = None
+        for lineno, text in matches[path]:
+            head = nearest_heading(lines, lineno - 1) if lines else None
+            if head and head != last_heading:
+                print(f"  {head}")
+                last_heading = head
+            print(f"    {lineno}: {text.strip()}")
+
+
+def _relpath(path):
+    p = Path(path)
+    bases = [(ROOT, "")]
+    if VAULT:
+        bases.append((VAULT, VAULT_LABEL))
+    for base, label in bases:
+        try:
+            r = p.relative_to(base)
+            return f"{label}/{r}" if label else str(r)
+        except ValueError:
+            continue
+    return str(p)
+
+
+# --- catalog ---------------------------------------------------------------
+
+def read_frontmatter(path):
+    """Return dict of YAML-ish frontmatter (name/description) if the file opens
+    with a --- fence. Cheap line parser, not a full YAML implementation."""
+    fm = {}
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            first = f.readline()
+            if first.strip() != "---":
+                return fm
+            for line in f:
+                if line.strip() == "---":
+                    break
+                m = re.match(r"^(\w[\w-]*):\s*(.*)$", line)
+                if m:
+                    key, val = m.group(1), m.group(2).strip()
+                    fm[key] = val.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return fm
+
+
+def first_meaningful_line(path):
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            in_fm = False
+            for i, line in enumerate(f):
+                s = line.strip()
+                if i == 0 and s == "---":
+                    in_fm = True
+                    continue
+                if in_fm:
+                    if s == "---":
+                        in_fm = False
+                    continue
+                if not s:
+                    continue
+                return s.lstrip("#").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def describe(path):
+    fm = read_frontmatter(path)
+    desc = fm.get("description") or first_meaningful_line(path)
+    desc = re.sub(r"\s+", " ", desc).strip()
+    if len(desc) > 100:
+        desc = desc[:97].rstrip() + "..."
+    return desc
+
+
+def build_catalog():
+    """Return catalog entry tuples. Each: (path_for_display, description, mtime, group)."""
+    entries = []
+
+    for base in (REFERENCE, DOCS):
+        if not base.is_dir():
+            continue
+        group = base.name + "/"
+        for p in sorted(base.glob("*.md")):
+            entries.append((f"{group}{p.name}", describe(p), p.stat().st_mtime, group))
+
+    if SKILLS.is_dir():
+        for skill_md in sorted(SKILLS.glob("*/SKILL.md")):
+            fm = read_frontmatter(skill_md)
+            name = fm.get("name") or skill_md.parent.name
+            desc = re.sub(r"\s+", " ", fm.get("description", "")).strip()
+            if len(desc) > 100:
+                desc = desc[:97].rstrip() + "..."
+            entries.append((f"skills/{name}/", desc, skill_md.stat().st_mtime, "skills/"))
+
+    # optional vault: top-level dirs only, file counts, never enumerate files
+    vault_lines = []
+    if VAULT and VAULT.is_dir():
+        for d in sorted(p for p in VAULT.iterdir() if p.is_dir() and not p.name.startswith(".")):
+            count = sum(1 for _ in d.rglob("*") if _.is_file())
+            vault_lines.append((f"{VAULT_LABEL}/{d.name}/", f"{count} files",
+                                d.stat().st_mtime, f"{VAULT_LABEL}/"))
+
+    entries.sort(key=lambda e: e[0])   # deterministic, cache-friendly
+    vault_lines.sort(key=lambda e: e[0])
+    return entries + vault_lines
+
+
+def render_catalog(entries):
+    lines = [f"- {path} — {desc}" if desc else f"- {path}"
+             for path, desc, _mtime, _group in entries]
+    body = "\n".join(lines) + "\n"
+    # ≤3KB budget: collapse least-recently-modified dirs to `dir/ (N files)`
+    if len(body.encode("utf-8")) > 3072:
+        entries = collapse_oversize(entries)
+        lines = [f"- {path} — {desc}" if desc else f"- {path}"
+                 for path, desc, _mtime, _group in entries]
+        body = "\n".join(lines) + "\n"
+    return body
+
+
+def collapse_oversize(entries):
+    """Collapse whole groups (least-recently-modified first) into a single
+    `- group (N files)` summary line until the rendered body fits 3KB."""
+    from collections import OrderedDict
+    groups = OrderedDict()
+    for e in entries:
+        groups.setdefault(e[3], []).append(e)
+
+    # group recency = newest mtime within the group
+    order = sorted(groups, key=lambda g: max(x[2] for x in groups[g]))
+    collapsed = set()
+    for g in order:
+        rendered = []
+        for grp, items in groups.items():
+            if grp in collapsed:
+                rendered.append((grp, f"({len(items)} files)", 0, grp))
+            else:
+                rendered.extend(items)
+        rendered.sort(key=lambda e: e[0])
+        body = "\n".join(f"- {p} — {d}" if d else f"- {p}"
+                         for p, d, _m, _gr in rendered)
+        if len((body + "\n").encode("utf-8")) <= 3072:
+            return rendered
+        collapsed.add(g)
+    # fully collapsed fallback
+    rendered = [(grp, f"({len(items)} files)", 0, grp) for grp, items in groups.items()]
+    rendered.sort(key=lambda e: e[0])
+    return rendered
+
+
+def cmd_catalog(args):
+    write = "--write" in args
+    entries = build_catalog()
+    body = render_catalog(entries)
+    if write:
+        GENERATED.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        header = (f"<!-- generated by mem catalog · {stamp} · "
+                  f"{len(body.encode('utf-8'))/1024:.1f}KB · do not hand-edit -->\n"
+                  f"# On-demand file catalog\n\n")
+        out = GENERATED / "catalog.md"
+        out.write_text(header + body, encoding="utf-8")
+        print(f"-> wrote {os.path.relpath(out, ROOT)} "
+              f"({len(body.encode('utf-8'))} bytes)", file=sys.stderr)
+    else:
+        sys.stdout.write(body)
+
+
+# --- --deep embeddings lane ------------------------------------------------
+#
+# sqlite-vec + an OpenAI embeddings model. Index at $XDG_DATA_HOME/mem/index.db
+# (per-machine, not in git). Incremental by mtime+hash. The API call uses stdlib
+# urllib (no openai package needed); the only non-stdlib dep is sqlite-vec, loaded
+# from the uv venv (its python wrapper is pure-python, so cross-interpreter import
+# is safe — the compiled part is a sqlite loadable extension, not a python C-ext).
+
+def _load_sqlite_vec(conn):
+    """Import sqlite_vec (from the venv if needed) and load the extension. Returns
+    the sqlite_vec module. Raises RuntimeError with a clean message on failure."""
+    try:
+        import sqlite_vec
+    except ImportError:
+        sitepkgs = glob.glob(str(VENV / "lib" / "*" / "site-packages"))
+        if sitepkgs and sitepkgs[0] not in sys.path:
+            sys.path.insert(0, sitepkgs[0])
+        try:
+            import sqlite_vec
+        except ImportError:
+            raise RuntimeError(
+                "sqlite-vec not available. Create the venv:\n"
+                f"  uv venv {VENV} && uv pip install --python {VENV}/bin/python sqlite-vec")
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except Exception as e:
+        raise RuntimeError(f"could not load sqlite-vec extension: {e}")
+    return sqlite_vec
+
+
+def get_openai_key():
+    """Return the embeddings API key, or None. Never printed or logged. Order:
+    OPENAI_API_KEY env, then a Bitwarden item named by MEM_OPENAI_BW_ITEM.
+
+    If neither is set, the --deep lane degrades to plain search."""
+    k = os.environ.get("OPENAI_API_KEY")
+    if k:
+        return k.strip()
+    item = os.environ.get("MEM_OPENAI_BW_ITEM")
+    if not item:
+        return None
+    session_file = Path.home() / ".bw_session"
+    env = dict(os.environ)
+    if session_file.exists():
+        env["BW_SESSION"] = session_file.read_text().strip()
+    try:
+        proc = subprocess.run(["bw", "get", "password", item],
+                              capture_output=True, text=True, env=env)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()   # into process only, never printed
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def openai_embed(texts, key):
+    """Embed a list of texts. Returns list[list[float]]. stdlib urllib only."""
+    import urllib.request
+    base = os.environ.get("MEM_EMBED_BASE_URL", "https://api.openai.com/v1")
+    req = urllib.request.Request(
+        base.rstrip("/") + "/embeddings",
+        data=json.dumps({"model": EMBED_MODEL, "input": texts,
+                         "dimensions": EMBED_DIMS}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        payload = json.load(resp)
+    return [row["embedding"] for row in payload["data"]]
+
+
+def file_hash(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def chunk_markdown(path):
+    """Yield (heading, text) chunks. Dailies: per structured entry. Other md:
+    per `##` section. ~500-token (≈2000 char) soft target — oversize sections
+    are split on blank lines."""
+    if DATE_RE.match(path.name):
+        for e in parse_daily(path):
+            head = f"{e.date} {e.time} [{e.slug}] {e.summary}"
+            text = head + "\n" + "\n".join(e.body)
+            yield from _split_chunk(head, text)
+        return
+    text = path.read_text(encoding="utf-8", errors="replace")
+    heading = path.name
+    buf = []
+    for line in text.splitlines():
+        if re.match(r"^##\s", line) and buf:
+            yield from _split_chunk(heading, "\n".join(buf))
+            heading = line.strip()
+            buf = [line]
+        else:
+            if re.match(r"^#{1,6}\s", line):
+                heading = line.strip()
+            buf.append(line)
+    if buf:
+        yield from _split_chunk(heading, "\n".join(buf))
+
+
+def _split_chunk(heading, text, limit=2000):
+    text = text.strip()
+    if not text:
+        return
+    if len(text) <= limit:
+        yield (heading, text)
+        return
+    para, size = [], 0
+    for block in text.split("\n\n"):
+        if size + len(block) > limit and para:
+            yield (heading, "\n\n".join(para))
+            para, size = [], 0
+        para.append(block)
+        size += len(block) + 2
+    if para:
+        yield (heading, "\n\n".join(para))
+
+
+def embed_corpus_files():
+    files = []
+    for base in (MEMORY, DOCS, REFERENCE):
+        if base.is_dir():
+            files += [p for p in base.glob("*.md")
+                      if p.name != "threads.md"]
+    return sorted(files)
+
+
+def open_index(create=True):
+    import sqlite3
+    if create:
+        INDEX_DB.parent.mkdir(parents=True, exist_ok=True)
+    elif not INDEX_DB.exists():
+        return None, None
+    conn = sqlite3.connect(str(INDEX_DB))
+    vec = _load_sqlite_vec(conn)
+    conn.execute("CREATE TABLE IF NOT EXISTS files "
+                 "(path TEXT PRIMARY KEY, mtime REAL, hash TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS chunks "
+                 "(id INTEGER PRIMARY KEY, path TEXT, heading TEXT, date TEXT, text TEXT)")
+    conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks "
+                 f"USING vec0(embedding float[{EMBED_DIMS}])")
+    conn.commit()
+    return conn, vec
+
+
+def cmd_embed(_args):
+    key = get_openai_key()
+    if not key:
+        die("no key configured: set OPENAI_API_KEY or MEM_OPENAI_BW_ITEM. "
+            "The --deep lane falls back to plain search until a key exists.")
+    try:
+        conn, vec = open_index(create=True)
+    except RuntimeError as e:
+        die(str(e))
+
+    changed = 0
+    for path in embed_corpus_files():
+        mtime = path.stat().st_mtime
+        h = file_hash(path)
+        row = conn.execute("SELECT mtime, hash FROM files WHERE path=?",
+                           (str(path),)).fetchone()
+        if row and row[1] == h:
+            continue
+        # re-embed this file: drop old chunks + vectors
+        old = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE path=?",
+                                          (str(path),)).fetchall()]
+        for cid in old:
+            conn.execute("DELETE FROM vec_chunks WHERE rowid=?", (cid,))
+        conn.execute("DELETE FROM chunks WHERE path=?", (str(path),))
+
+        chunks = list(chunk_markdown(path))
+        if chunks:
+            date = path.stem if DATE_RE.match(path.name) else ""
+            texts = [c[1] for c in chunks]
+            embeddings = []
+            for i in range(0, len(texts), 128):        # batch API calls
+                embeddings += openai_embed(texts[i:i + 128], key)
+            for (heading, text), emb in zip(chunks, embeddings):
+                cur = conn.execute(
+                    "INSERT INTO chunks(path, heading, date, text) VALUES (?,?,?,?)",
+                    (str(path), heading, date, text))
+                cid = cur.lastrowid
+                conn.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?,?)",
+                             (cid, vec.serialize_float32(emb)))
+        conn.execute("INSERT OR REPLACE INTO files(path, mtime, hash) VALUES (?,?,?)",
+                     (str(path), mtime, h))
+        conn.commit()
+        changed += 1
+    print(f"embed: {changed} file(s) updated, index at {INDEX_DB}", file=sys.stderr)
+
+
+def deep_search(query, k=10):
+    key = get_openai_key()
+    if key is None or not INDEX_DB.exists():
+        why = "no API key configured" if key is None else "no index (run `mem embed`)"
+        print(f"[--deep unavailable: {why}; falling back to plain search]\n",
+              file=sys.stderr)
+        return plain_search(query)
+    try:
+        conn, vec = open_index(create=False)
+        if conn is None:
+            raise RuntimeError("no index")
+        qvec = openai_embed([query], key)[0]
+        # vec0 KNN needs the LIMIT directly on the vec table scan (a JOIN hides it
+        # from the planner -> "LIMIT or k=? required"). So: KNN first, hydrate after.
+        knn = conn.execute(
+            "SELECT rowid, distance FROM vec_chunks "
+            "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            (vec.serialize_float32(qvec), k)).fetchall()
+        rows = []
+        for cid, dist in knn:
+            c = conn.execute("SELECT path, heading, date, text FROM chunks WHERE id=?",
+                             (cid,)).fetchone()
+            if c:
+                rows.append((c[0], c[1], c[2], c[3], dist))
+    except Exception as e:
+        print(f"[--deep failed ({e}); falling back to plain search]\n", file=sys.stderr)
+        return plain_search(query)
+
+    # hybrid: merge with plain rg hits, dedupe by (path, heading)
+    seen = set()
+    print(f"=== semantic hits for {query!r} ===")
+    for path, heading, date, text, dist in rows:
+        key_pair = (path, heading)
+        if key_pair in seen:
+            continue
+        seen.add(key_pair)
+        snippet = re.sub(r"\s+", " ", text).strip()[:200]
+        tag = f"{date} " if date else ""
+        print(f"\n{_relpath(path)}  {tag}(dist {dist:.3f})")
+        print(f"  {heading}")
+        print(f"    {snippet}")
+    print("\n=== keyword hits (rg) ===")
+    plain_search(query)
+
+
+# --- dispatch --------------------------------------------------------------
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    verb = argv[0]
+    if verb == "search":
+        cmd_search(argv[1:])
+    elif verb == "thread":
+        cmd_thread(argv[1:])
+    elif verb == "threads":
+        cmd_threads(argv[1:])
+    elif verb == "recent":
+        cmd_recent(argv[1:])
+    elif verb == "show":
+        cmd_show(argv[1:])
+    elif verb == "close":
+        cmd_close(argv[1:])
+    elif verb == "catalog":
+        cmd_catalog(argv[1:])
+    elif verb == "embed":
+        cmd_embed(argv[1:])
+    else:
+        cmd_capture(argv)          # bare `mem [-t slug] "summary"`
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass

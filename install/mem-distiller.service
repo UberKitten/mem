@@ -1,0 +1,20 @@
+# systemd user service for the nightly memory distiller (Linux).
+#
+# Setup (as your normal user, not root):
+#   1. Edit ExecStart below to point at your checkout.
+#   2. mkdir -p ~/.config/systemd/user
+#   3. cp install/mem-distiller.service install/mem-distiller.timer ~/.config/systemd/user/
+#   4. systemctl --user daemon-reload
+#   5. systemctl --user enable --now mem-distiller.timer
+#   Run once now:  systemctl --user start mem-distiller.service
+#   Watch logs:    journalctl --user -u mem-distiller.service -f
+#
+# Config (MEM_ROOT etc.) is read from ~/.config/mem/config by the script itself.
+
+[Unit]
+Description=Nightly memory distiller (threads.md refresh)
+
+[Service]
+Type=oneshot
+# Edit this path to your checkout:
+ExecStart=/bin/bash %h/mem/distiller/memory-distiller.sh

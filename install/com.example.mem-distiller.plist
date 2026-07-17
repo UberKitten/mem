@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the nightly memory distiller (macOS).
+
+  Setup:
+    1. Edit the paths below: replace __HOME__ with your home dir (e.g. /Users/you)
+       and __REPO__ with the path to this checkout.
+    2. Copy to ~/Library/LaunchAgents/com.example.mem-distiller.plist
+    3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.mem-distiller.plist
+    4. To run once immediately:
+       launchctl kickstart -k gui/$(id -u)/com.example.mem-distiller
+
+  Runs nightly at 04:30 local time. Logs to __HOME__/.local/share/mem/distiller/logs/.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.mem-distiller</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>PATH</key>
+		<string>__REPO__/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__REPO__/distiller/memory-distiller.sh</string>
+	</array>
+
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>__HOME__/.local/share/mem/distiller/logs/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.local/share/mem/distiller/logs/launchd.log</string>
+</dict>
+</plist>
