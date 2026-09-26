@@ -136,9 +136,20 @@ fresh `threads.md`), **enforce** (validate format + 16KB cap + sane thread count
 keep yesterday's file on any failure). It also refreshes the embeddings index and
 the catalog if those are in use.
 
-The judge is any `claude --print`-compatible CLI — reads a prompt on stdin, writes
-the file to stdout. Configure the binary/model in `~/.config/mem/config`, or override
-the whole command with `MEM_JUDGE_CMD` to use a different provider.
+The judge is the shell command configured in `MEM_JUDGE_CMD`. It receives the prompt
+and working set on stdin and must write a complete `threads.md` candidate to stdout;
+stderr remains visible in the distiller log. Provider, model, and authentication
+options belong to that command or its environment. For example:
+
+```sh
+MEM_JUDGE_CMD='llm -m gpt-4o'
+# Explicit Claude Code adapter:
+MEM_JUDGE_CMD='claude --print'
+```
+
+The wrapper permits only one concurrent run and does not impose a judge timeout. A
+nonzero judge exit stops the run with the same status and leaves the previous
+`threads.md` unchanged.
 
 Run it by hand:
 
@@ -248,10 +259,7 @@ lines). See `install/config.example`.
 | `MEM_VAULT` | *(unset)* | Optional extra read-only root folded into search + catalog |
 | `MEM_VAULT_LABEL` | `vault` | Display label for `MEM_VAULT` paths in output |
 | `MEM_NO_COMMIT` | *(unset)* | Any value disables the git commit on capture/close |
-| `MEM_CLAUDE_BIN` | `claude` | Distiller judge CLI (must accept `--print`, stdin→stdout) |
-| `MEM_JUDGE_MODEL` | *(CLI default)* | Model passed to the judge as `--model` |
-| `MEM_JUDGE_CMD` | *(unset)* | Full override of the judge command (ignores the two above) |
-| `MEM_CLAUDE_OAUTH_TOKEN_FILE` | `~/.config/mem/claude-oauth-token` | Optional long-lived headless token file |
+| `MEM_JUDGE_CMD` | *(required)* | Judge shell command; prompt and working set on stdin, candidate `threads.md` on stdout |
 | `MEM_PYTHON` | `python3` | Python interpreter the distiller uses |
 | `OPENAI_API_KEY` | *(unset)* | Embeddings key for `--deep` (takes precedence over Bitwarden) |
 | `MEM_OPENAI_BW_ITEM` | *(unset)* | Bitwarden item id/name holding the embeddings key |

@@ -14,19 +14,15 @@ MEM_ROOT=$HOME/memory-workspace
 # Disable the automatic git commit on capture (any non-empty value disables it).
 # MEM_NO_COMMIT=1
 
-# --- distiller: judge CLI ---
-# Any `claude --print`-compatible CLI works (reads a prompt on stdin, writes the
-# file to stdout). Set the binary and/or model here.
-# MEM_CLAUDE_BIN=claude
-# MEM_JUDGE_MODEL=
-
-# Full override of the judge command (reads stdin -> stdout). If set, the two
-# vars above are ignored. Use this to plug in a different provider's CLI.
-# MEM_JUDGE_CMD=llm -m gpt-4o
-
-# Optional long-lived headless auth token file for the judge CLI (avoids
-# interactive-login token expiry under cron).
-# MEM_CLAUDE_OAUTH_TOKEN_FILE=$HOME/.config/mem/claude-oauth-token
+# --- distiller: judge command ---
+# Required unless the distiller runs with --skip-judge. This is a shell command
+# that reads the prompt and working set from stdin and writes a complete
+# threads.md candidate to stdout. Put provider/model/authentication options in
+# the command or its environment.
+# MEM_JUDGE_CMD='llm -m gpt-4o'
+#
+# Explicit Claude Code adapter:
+# MEM_JUDGE_CMD='claude --print'
 
 # --- optional: --deep embeddings lane ---
 # An OpenAI-compatible embeddings API key. Prefer setting OPENAI_API_KEY in the

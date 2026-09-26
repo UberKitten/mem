@@ -7,9 +7,9 @@
 #              current threads.md + per-slug staleness, assemble one working-set doc.
 #              Also refresh the embeddings index + on-demand catalog via the `mem`
 #              CLI if it exists (tolerated absent).
-#   2. judge   (LLM)        — a `claude --print`-compatible CLI subprocess with
-#              memory-distiller.prompt.md + the working set. Emits a complete
-#              replacement threads.md.
+#   2. judge   (LLM)        — the configured judge command receives
+#              memory-distiller.prompt.md + the working set on stdin and emits a
+#              complete replacement threads.md on stdout.
 #   3. enforce (mechanical) — validate format / <=16KB / sane thread count. On
 #              failure: keep yesterday's threads.md, log loudly, exit nonzero (the
 #              health check surfaces it). On success: write, git-commit, advance
@@ -22,16 +22,12 @@
 #   memory-distiller.sh --no-commit     # write threads.md but don't git-commit / don't advance
 #                                       #   watermark (dry-review / test mode)
 #   memory-distiller.sh --since DATE    # override the input window (YYYY-MM-DD); doesn't persist
-#   memory-distiller.sh --model NAME    # override the judge model
 #   memory-distiller.sh --skip-judge    # reuse the last judge-output.md (gather+enforce only; for tests/CI)
 #
 # Configuration (env overrides a config file at $XDG_CONFIG_HOME/mem/config):
 #   MEM_ROOT            workspace root (default: $HOME/memory-workspace)
-#   MEM_CLAUDE_BIN      judge CLI binary (default: claude); must accept `--print` and
-#                       read a prompt on stdin, writing the file content to stdout.
-#   MEM_JUDGE_MODEL     judge model passed as `--model` (default: the CLI's default)
-#   MEM_JUDGE_CMD       full override of the judge command (reads stdin -> stdout);
-#                       if set, MEM_CLAUDE_BIN / MEM_JUDGE_MODEL are ignored.
+#   MEM_JUDGE_CMD       judge command (required unless --skip-judge); receives the
+#                       prompt and working set on stdin and writes threads.md to stdout.
 
 set -euo pipefail
 
@@ -62,23 +58,12 @@ MAX_THREADS=60          # sanity ceiling
 # System python is stdlib-only and dodges macOS launchd-network (TCC) surprises.
 PYTHON="${MEM_PYTHON:-python3}"
 
-CLAUDE_BIN="${MEM_CLAUDE_BIN:-claude}"
-
 mkdir -p "$STATE_DIR" "$LOG_DIR"
-
-# Optional long-lived headless auth token for the judge CLI. Interactive-login
-# tokens often expire and 401 under cron; a setup/long-lived token lasts longer.
-_oauth_token_file="${MEM_CLAUDE_OAUTH_TOKEN_FILE:-$HOME/.config/mem/claude-oauth-token}"
-if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -r "$_oauth_token_file" ]; then
-    CLAUDE_CODE_OAUTH_TOKEN="$(cat "$_oauth_token_file")"
-    export CLAUDE_CODE_OAUTH_TOKEN
-fi
 
 # --- flags ---
 MODE="cron"
 DO_COMMIT=true
 SINCE_OVERRIDE=""
-MODEL="${MEM_JUDGE_MODEL:-}"
 SKIP_JUDGE=false        # reuse existing judge-output.md instead of calling the CLI (test/iterate)
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -86,7 +71,6 @@ while [ $# -gt 0 ]; do
         --skip-judge) SKIP_JUDGE=true; shift ;;
         --no-commit)  DO_COMMIT=false; shift ;;
         --since)      SINCE_OVERRIDE="${2:-}"; shift 2 ;;
-        --model)      MODEL="${2:-}"; shift 2 ;;
         *)            echo "memory-distiller: unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -281,25 +265,17 @@ if [ "$SKIP_JUDGE" = true ]; then
     echo "- judge: SKIPPED (--skip-judge) — reusing $RAW_OUT ($(wc -c < "$RAW_OUT" | tr -d ' ') bytes)"
 else
     # Combined prompt = instructions + working set, piped on stdin (avoids ARG_MAX).
-    if [ -n "${MEM_JUDGE_CMD:-}" ]; then
-        echo "- judge: invoking custom MEM_JUDGE_CMD"
-        echo "---------------------------------------------------"
-        set +e
-        { cat "$PROMPT_FILE"; echo; echo "==================== WORKING SET ===================="; echo; cat "$WORKING_SET"; } \
-            | sh -c "$MEM_JUDGE_CMD" > "$RAW_OUT"
-        JUDGE_RC=$?
-        set -e
-    else
-        echo "- judge: invoking $CLAUDE_BIN --print${MODEL:+ --model $MODEL}"
-        echo "---------------------------------------------------"
-        CLAUDE_ARGS=(--print --permission-mode bypassPermissions)
-        [ -n "$MODEL" ] && CLAUDE_ARGS+=(--model "$MODEL")
-        set +e
-        { cat "$PROMPT_FILE"; echo; echo "==================== WORKING SET ===================="; echo; cat "$WORKING_SET"; } \
-            | "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" > "$RAW_OUT"
-        JUDGE_RC=$?
-        set -e
+    if [ -z "${MEM_JUDGE_CMD:-}" ]; then
+        echo "ERROR: MEM_JUDGE_CMD is not configured — set it to a command that reads stdin and writes stdout" >&2
+        exit 1
     fi
+    echo "- judge: invoking MEM_JUDGE_CMD"
+    echo "---------------------------------------------------"
+    set +e
+    { cat "$PROMPT_FILE"; echo; echo "==================== WORKING SET ===================="; echo; cat "$WORKING_SET"; } \
+        | sh -c "$MEM_JUDGE_CMD" > "$RAW_OUT"
+    JUDGE_RC=$?
+    set -e
     echo "---------------------------------------------------"
     if [ "$JUDGE_RC" -ne 0 ]; then
         echo "ERROR: judge exited $JUDGE_RC — keeping previous threads.md" >&2

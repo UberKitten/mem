@@ -115,11 +115,12 @@ Three files: `distiller/memory-distiller.sh` (wrapper), `memory-distiller.prompt
    (`state.json`) from the dailies; include the current `threads.md`; compute
    per-thread staleness (days since last entry). Assemble one working-set document.
    Also run `mem embed` and `mem catalog --write` (mechanical freshness, no LLM).
-2. **Judge (LLM):** a `claude --print`-compatible CLI subprocess with the prompt +
-   working set. Output: complete new `threads.md` content. The judge command is
-   configurable (`MEM_CLAUDE_BIN` / `MEM_JUDGE_MODEL`, or a full `MEM_JUDGE_CMD`
-   override), so any provider CLI that reads a prompt on stdin and writes to stdout
-   works.
+2. **Judge (LLM):** the shell command in `MEM_JUDGE_CMD` receives the prompt +
+   working set on stdin and writes a complete new `threads.md` candidate to stdout.
+   Provider, model, and authentication options are part of that command or its
+   environment; the distiller adds none. Stderr is inherited. The single-instance
+   lock prevents overlapping runs, and the wrapper imposes no judge timeout. A
+   nonzero exit stops the run with the same status and preserves the previous file.
 3. **Enforce + commit (mechanical):** validate — parses as the expected format,
    ≤16KB, sane thread count (reject if empty-when-input-nonempty or >60 threads).
    On failure: keep yesterday's `threads.md`, log loudly, exit nonzero (the health
